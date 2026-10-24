@@ -168,10 +168,12 @@ module vec_alu (
           wide_result = {33'b0, a[31:0]} - {33'b0, b[31:0]};
         else
           wide_result = {33'b0, a[31:0]} + {33'b0, b[31:0]};
-          error = sub ? ((a[31] != b[31]) && (a[31] != wide_result[31])) : 
-                        ((a[31] == b[31]) && (a[31] != wide_result[31]));
-          if (!error)
-            result = {32'b0, wide_result[31:0]};
+
+        error = sub ? ((a[31] != b[31]) && (a[31] != wide_result[31])) :
+                      ((a[31] == b[31]) && (a[31] != wide_result[31]));
+
+        if (!error)
+          result = {32'b0, wide_result[31:0]};
       end
 
       ADD_U32, SUB_U32: begin
@@ -180,10 +182,11 @@ module vec_alu (
           wide_result = {33'b0, a[31:0]} - {33'b0, b[31:0]};
         else
           wide_result = {33'b0, a[31:0]} + {33'b0, b[31:0]};
-          error = sub ? (a[31:0] < b[31:0]) : wide_result[32];
-          
-          if (!error)
-            result = {32'b0, wide_result[31:0]};
+
+        error = sub ? (a[31:0] < b[31:0]) : wide_result[32];
+
+        if (!error)
+          result = {32'b0, wide_result[31:0]};
       end
 
       ADD_I64, SUB_I64: begin
@@ -193,24 +196,24 @@ module vec_alu (
         else
           wide_result = {1'b0, a} + {1'b0, b};
 
-          error = sub ? ((a[63] != b[63]) && (a[63] != wide_result[63])) : 
-                        ((a[63] == b[63]) && (a[63] != wide_result[63]));
+        error = sub ? ((a[63] != b[63]) && (a[63] != wide_result[63])) :
+                      ((a[63] == b[63]) && (a[63] != wide_result[63]));
 
-          if (!error)
-            result = wide_result[63:0];
+        if (!error)
+          result = wide_result[63:0];
       end
 
       ADD_U64, SUB_U64: begin
-          // ADD.U64 / SUB.U64
-          if (sub)
-            wide_result = {1'b0, a} - {1'b0, b};
-          else
-            wide_result = {1'b0, a} + {1'b0, b};
+        // ADD.U64 / SUB.U64
+        if (sub)
+          wide_result = {1'b0, a} - {1'b0, b};
+        else
+          wide_result = {1'b0, a} + {1'b0, b};
 
-            error = sub ? (a < b) : wide_result[64];
+        error = sub ? (a < b) : wide_result[64];
 
-            if (!error)
-              result = wide_result[63:0];
+        if (!error)
+          result = wide_result[63:0];
       end
 
       EQ_F16, EQ_F32, EQ_I32, EQ_U32, EQ_I64, EQ_U64: begin
