@@ -1,6 +1,6 @@
 // Command decoder: splits the 32-bit word and rejects illegal commands before
-// any lane writes. Covers the CONTROL and ALU families; other families are illegal
-// until their execution units exist.
+// any lane writes. Covers CONTROL, ALU, and the PRODUCT FMAs; everything else is
+// illegal until its execution unit exists.
 // Word: FAMILY[31:29] | SIG[28:22] | D[21:18] | A[17:13] | B[12:8] | C[7:3] | PM[2:0]
 module vec_decoder (
   input  logic [31:0] command,
@@ -13,17 +13,23 @@ module vec_decoder (
   output logic [2:0]  pm,
   output logic        is_control,
   output logic        is_alu,
+  output logic        is_product,
   output logic        predicate_dest,    // ALU result is a predicate written to P[D]
-  output logic        scalar_dest,       // ALU numeric result is written to S[D-8]
+  output logic        scalar_dest,       // numeric result is written to S[D-8]
   output logic        illegal
 );
 
   localparam logic [2:0] FAMILY_CONTROL = 3'b000;
   localparam logic [2:0] FAMILY_ALU     = 3'b001;
+  localparam logic [2:0] FAMILY_PRODUCT = 3'b010;
 
   localparam logic [6:0] SETVL = 7'd0;
   localparam logic [6:0] PAND  = 7'd1;
   localparam logic [6:0] PNOT  = 7'd2;
+
+  localparam logic [6:0] FMA_F16     = 7'd0;
+  localparam logic [6:0] FMA_F32     = 7'd1;
+  localparam logic [6:0] FMA_F16_F32 = 7'd2;
 
   localparam logic [4:0] K_NEG_ZERO = 5'd17;
   localparam logic [4:0] K_ONES     = 5'd19;
@@ -56,11 +62,12 @@ module vec_decoder (
 
   assign is_control = (family == FAMILY_CONTROL);
   assign is_alu     = (family == FAMILY_ALU);
+  assign is_product = (family == FAMILY_PRODUCT);
 
   assign select_op      = (fn == 4'd4);
   assign clz_op         = (fn == 4'd9);
   assign predicate_dest = is_alu && ((fn == 4'd2) || (fn == 4'd3)); // EQ / LT
-  assign scalar_dest    = is_alu && !predicate_dest && d_code[3];
+  assign scalar_dest    = ((is_alu && !predicate_dest) || is_product) && d_code[3];
 
   always_comb begin
     illegal = 1'b0;
@@ -106,6 +113,20 @@ module vec_decoder (
                   (predicate_dest && ((d_code == 0) || (d_code > 4'd7))) ||
                   // A scalar result needs scalar or constant inputs.
                   (scalar_dest && ((a_code < 5'd8) || (!clz_op && (b_code < 5'd8))));
+      end
+
+      FAMILY_PRODUCT: begin
+        case (sig)
+          // A, B, C are floating operands; C is the addend.
+          FMA_F16, FMA_F32, FMA_F16_F32:
+            illegal = !operand_ok(a_code, 1'b1) ||
+                      !operand_ok(b_code, 1'b1) ||
+                      !operand_ok(c_code, 1'b1) ||
+                      (scalar_dest && ((a_code < 5'd8) || (b_code < 5'd8) || (c_code < 5'd8)));
+
+          // WMAC, MULSHIFT, MUL_CHECK: not implemented yet.
+          default: illegal = 1'b1;
+        endcase
       end
 
       default: illegal = 1'b1;

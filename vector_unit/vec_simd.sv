@@ -31,7 +31,8 @@ module vec_simd #(
   logic [3:0] d_code;
   logic [4:0] a_code, b_code, c_code;
   logic [2:0] pm;
-  logic is_control, is_alu, predicate_dest, scalar_dest, illegal;
+  logic is_control, is_alu, is_product, predicate_dest, scalar_dest, illegal;
+  logic lane_command;                   // executed by the lanes (ALU, PRODUCT)
 
   logic [63:0]          s_reg [8];
   logic [NUM_LANES-1:0] p_reg [8];
@@ -60,6 +61,7 @@ module vec_simd #(
     .pm(pm),
     .is_control(is_control),
     .is_alu(is_alu),
+    .is_product(is_product),
     .predicate_dest(predicate_dest),
     .scalar_dest(scalar_dest),
     .illegal(illegal)
@@ -79,6 +81,7 @@ module vec_simd #(
       vec_lane #(.LANE_INDEX(i)) vec_lane_inst (
         .clk(clk),
         .rst_n(rst_n),
+        .family(family),
         .sig(sig),
         .d_code(d_code),
         .a_code(a_code),
@@ -87,7 +90,7 @@ module vec_simd #(
         .pm(pm),
         .vl(vl),
         .strict(strict),
-        .commit(commit && is_alu),
+        .commit(commit && lane_command),
         .s_reg(s_reg),
         .p_bits(p_bits),
         .enable(lane_enable[i]),
@@ -122,8 +125,10 @@ module vec_simd #(
     setvl_error = is_control && (sig == SETVL) && (setvl_value > NUM_LANES[31:0]);
   end
 
+  assign lane_command = is_alu || is_product;
+
   // Check every enabled lane before committing any output.
-  assign fault  = valid && !faulted && (illegal || setvl_error || (is_alu && |lane_error));
+  assign fault  = valid && !faulted && (illegal || setvl_error || (lane_command && |lane_error));
   assign commit = valid && !faulted && !fault;
   assign done   = commit;
   assign error  = valid && (faulted || fault);
@@ -175,7 +180,7 @@ module vec_simd #(
         endcase
       end
 
-      if (commit && is_alu) begin
+      if (commit && lane_command) begin
         // EQ / LT: enabled lanes write their bit; disabled lanes keep theirs.
         if (predicate_dest)
           p_reg[d_code[2:0]] <= (lane_predicate_result & lane_enable) |
