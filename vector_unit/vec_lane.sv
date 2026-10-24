@@ -1,26 +1,29 @@
-// One SIMD lane: operand decode, lane enable, ALU, and this lane's write request.
+// One SIMD lane: lane-local V0..V7, operand muxes, lane enable, ALU, and writeback.
 // Instruction-wide decisions (legality, commit on any-lane error, scalar-once,
-// SELECT's lowest-enabled-lane rule for scalar D) belong to the lane array.
+// S and P writes) belong to vec_simd.
 module vec_lane #(
   parameter int LANE_INDEX = 0
 ) (
+  input  logic        clk,
+  input  logic        rst_n,
+
   input  logic [6:0]  sig,
+  input  logic [3:0]  d_code,            // D field: 0-7 V, 8-15 S
   input  logic [4:0]  a_code,            // A field: 0-7 V, 8-15 S, 16-19 constants
   input  logic [4:0]  b_code,            // B field: same encoding as A
   input  logic [4:0]  c_code,            // C field: SELECT choice predicate P0..P7
   input  logic [2:0]  pm,                // execution mask predicate P0..P7
   input  logic [31:0] vl,                // active vector length
   input  logic        strict,            // 1: saturation is an error
+  input  logic        commit,            // ALU command passed every lane's checks
 
-  input  logic [63:0] v_reg [8],         // this lane's cell of V0..V7
-  input  logic [63:0] s_reg [8],         // S0..S7, shared by all lanes
+  input  logic [63:0] s_reg [8],         // S0..S7, broadcast to all lanes
   input  logic [7:0]  p_bits,            // this lane's bit of P0..P7
 
   output logic        enable,            // lane is below VL and its PM bit is true
   output logic        error,             // only raised by enabled lanes
   output logic        saturated_add,
   output logic        saturated_sub,
-  output logic        write_predicate,   // 1: write predicate_result to P[D], 0: write result to D
   output logic        predicate_result,
   output logic [63:0] result
 );
@@ -30,12 +33,14 @@ module vec_lane #(
   localparam logic [4:0] K_ONE      = 5'd18;
   localparam logic [4:0] K_ONES     = 5'd19;
 
+  logic [63:0] v_reg [8];
+
   logic [7:0]  p_live;
   logic [63:0] a, b;
   logic [63:0] k_neg_zero, k_one, k_ones;
+  logic        write_predicate;
 
   logic alu_error;
-  logic alu_predicate_result;
   logic alu_saturated_add, alu_saturated_sub;
 
   // P0 is always true.
@@ -75,7 +80,7 @@ module vec_lane #(
     endcase
   end
 
-  // Operand codes 20-31 are rejected by the decoder before issue.
+  // Operand codes 20-31 are rejected by vec_decoder.
   always_comb begin
     case (a_code)
       K_ZERO:     a = 64'b0;
@@ -101,7 +106,7 @@ module vec_lane #(
     .select_predicate(p_live[c_code[2:0]]),
     .strict(strict),
     .error(alu_error),
-    .predicate_result(alu_predicate_result),
+    .predicate_result(predicate_result),
     .saturated_add(alu_saturated_add),
     .saturated_sub(alu_saturated_sub),
     .result(result)
@@ -111,6 +116,15 @@ module vec_lane #(
   assign error = enable && alu_error;
   assign saturated_add = enable && alu_saturated_add;
   assign saturated_sub = enable && alu_saturated_sub;
-  assign predicate_result = alu_predicate_result;
+
+  // Writeback: vector destinations only. Registers start at zero.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      for (int i = 0; i < 8; i++)
+        v_reg[i] <= 64'b0;
+    end else if (commit && enable && !write_predicate && !d_code[3]) begin
+      v_reg[d_code[2:0]] <= result;
+    end
+  end
 
 endmodule
