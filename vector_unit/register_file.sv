@@ -1,35 +1,47 @@
-`timescale 1ns / 1ps
-
+// Central register file: V0-V7 (one DATA_WIDTH element per lane), S0-S7, P0-P7
+// (one bit per lane, P0 always true) and VL.
+//
+// Reads are combinational. Writes happen on the clock edge, so a command can read
+// and write the same register (all inputs are read before any output is written).
+// There is no forwarding: the unit is single-cycle, and forwarding a result back
+// into the operands that produce it would form a combinational loop.
+//
+// Constants (operand codes 16-19) depend on the operand type, so the lanes make
+// them; these read ports return 0 for those codes.
 module register_file #(
     parameter int DATA_WIDTH = 64,
-    parameter int NUM_LANES  = 8,
+    parameter int NUM_LANES  = 8
 ) (
     input  logic                                        clk,
     input  logic                                        rst_n,
 
-    input  logic [4:0]                                  raddr_a,  //Address of A 5 bits
-    input  logic [4:0]                                  raddr_b,  //Address of B 5 bits
-    input  logic [4:0]                                  raddr_c,  //Address of C 5 bits 
-    input  logic [2:0]                                  pm_sel,   //Which predicate bit to be selected from P0 to P7
+    input  logic [4:0]                                  raddr_a,  // operand code of A: 0-7 V, 8-15 S
+    input  logic [4:0]                                  raddr_b,  // operand code of B
+    input  logic [4:0]                                  raddr_c,  // operand code of C
+    input  logic [2:0]                                  pm_sel,   // execution mask predicate P0..P7
 
-    output logic [NUM_LANES-1:0][DATA_WIDTH-1:0]        rdata_a,  //
+    output logic [NUM_LANES-1:0][DATA_WIDTH-1:0]        rdata_a,  // V: per lane, S: broadcast
     output logic [NUM_LANES-1:0][DATA_WIDTH-1:0]        rdata_b,
     output logic [NUM_LANES-1:0][DATA_WIDTH-1:0]        rdata_c,
-    output logic [NUM_LANES-1:0]                        rdata_pm,
-    output logic [NUM_LANES-1:0]                        rdata_p_a,
-    output logic [NUM_LANES-1:0]                        rdata_p_b,
-    output logic [NUM_LANES-1:0]                        rdata_p_c,
-    output logic [31:0]                         vl_out,
+    output logic [NUM_LANES-1:0]                        rdata_pm, // P[pm_sel]
+    output logic [NUM_LANES-1:0]                        rdata_p_a, // P[A] (PAND, PNOT)
+    output logic [NUM_LANES-1:0]                        rdata_p_b, // P[B] (PAND)
+    output logic [NUM_LANES-1:0]                        rdata_p_c, // P[C] (SELECT)
+    output logic [31:0]                                 vl_out,
 
+    // Lane mask shared by both write ports (V and P writes only).
+    input  logic [NUM_LANES-1:0]                        lane_mask,
+
+    // Write port D
     input  logic [3:0]                                  waddr_d,
     input  logic                                        wren_v_d,
     input  logic                                        wren_s_d,
     input  logic                                        wren_p_d,
-    input  logic [1:0]                                  wsize_d,
-    input  logic [NUM_LANES-1:0]                        lane_mask_d,
-    input  logic [NUM_LANES-1:0][DATA_WIDTH-1:0]        wdata_d,
+    input  logic [1:0]                                  wsize_d,  // 0: 16 bits, 1: 32 bits, else 64
+    input  logic [NUM_LANES-1:0][DATA_WIDTH-1:0]        wdata_d,  // S writes take lane 0
     input  logic [NUM_LANES-1:0]                        wdata_p_d,
 
+    // Write port C (DIVMOD remainder)
     input  logic [3:0]                                  waddr_c,
     input  logic                                        wren_v_c,
     input  logic                                        wren_s_c,
@@ -38,35 +50,15 @@ module register_file #(
     input  logic [NUM_LANES-1:0][DATA_WIDTH-1:0]        wdata_c,
     input  logic [NUM_LANES-1:0]                        wdata_p_c,
 
+    // VL is stored as given; the top level faults a value above NUM_LANES.
     input  logic                                        setvl_en,
-    input  logic [31:0]                                 setvl_val,
-
-    output logic                                        divmod_conflict
+    input  logic [31:0]                                 setvl_val
 );
 
     logic [NUM_LANES-1:0][DATA_WIDTH-1:0] v_reg [0:7];
     logic [DATA_WIDTH-1:0]                s_reg [0:7];
     logic [NUM_LANES-1:0]                 p_reg [0:7];
-    logic [31:0]                  vl_reg;
-
-
-    //defining the constants
-    localparam logic [DATA_WIDTH-1:0] CONST_ZERO     = '0;
-    localparam logic [DATA_WIDTH-1:0] CONST_ALL_ONES = '1;
-    localparam logic [DATA_WIDTH-1:0] CONST_ONE      = {{(DATA_WIDTH-1){1'b0}}, 1'b1};
-    localparam logic [DATA_WIDTH-1:0] CONST_NEG_ZERO = {1'b1, {(DATA_WIDTH-1){1'b0}}};
-
-    logic [DATA_WIDTH-1:0] bval_a, bval_b, bval_c;
-
-    always_comb begin
-        divmod_conflict = 1'b0;
-        if ((wren_v_d && wren_v_c) && (waddr_d[2:0] == waddr_c[2:0]))
-            divmod_conflict = 1'b1;
-        if ((wren_s_d && wren_s_c) && (waddr_d[2:0] == waddr_c[2:0]))
-            divmod_conflict = 1'b1;
-        if ((wren_p_d && wren_p_c) && (waddr_d[2:0] == waddr_c[2:0]))
-            divmod_conflict = 1'b1;
-    end
+    logic [31:0]                          vl_reg;
 
     function automatic [DATA_WIDTH-1:0] format_wdata(
         input logic [DATA_WIDTH-1:0] data,
@@ -79,70 +71,34 @@ module register_file #(
         endcase
     endfunction
 
-    always_comb begin
-        case (raddr_a)
-            5'd8,  5'd9,  5'd10, 5'd11,
-            5'd12, 5'd13, 5'd14, 5'd15: bval_a = s_reg[raddr_a[2:0]];
-            5'd16:                      bval_a = CONST_ZERO;
-            5'd17:                      bval_a = CONST_NEG_ZERO;
-            5'd18:                      bval_a = CONST_ONE;
-            5'd19:                      bval_a = CONST_ALL_ONES;
-            default:                    bval_a = '0;
-        endcase
-
-        case (raddr_b)
-            5'd8,  5'd9,  5'd10, 5'd11,
-            5'd12, 5'd13, 5'd14, 5'd15: bval_b = s_reg[raddr_b[2:0]];
-            5'd16:                      bval_b = CONST_ZERO;
-            5'd17:                      bval_b = CONST_NEG_ZERO;
-            5'd18:                      bval_b = CONST_ONE;
-            5'd19:                      bval_b = CONST_ALL_ONES;
-            default:                    bval_b = '0;
-        endcase
-
-        case (raddr_c)
-            5'd8,  5'd9,  5'd10, 5'd11,
-            5'd12, 5'd13, 5'd14, 5'd15: bval_c = s_reg[raddr_c[2:0]];
-            5'd16:                      bval_c = CONST_ZERO;
-            5'd17:                      bval_c = CONST_NEG_ZERO;
-            5'd18:                      bval_c = CONST_ONE;
-            5'd19:                      bval_c = CONST_ALL_ONES;
-            default:                    bval_c = '0;
-        endcase
-
-        if (raddr_a <= 5'd7)
-            rdata_a = v_reg[raddr_a[2:0]];
+    // Codes 0-7 read a V register, 8-15 broadcast an S register, anything else is 0.
+    function automatic logic [NUM_LANES-1:0][DATA_WIDTH-1:0] read_operand(input logic [4:0] addr);
+        if (addr <= 5'd7)
+            read_operand = v_reg[addr[2:0]];
+        else if (addr <= 5'd15)
+            for (int i = 0; i < NUM_LANES; i++) read_operand[i] = s_reg[addr[2:0]];
         else
-            for (int i = 0; i < NUM_LANES; i++) rdata_a[i] = bval_a;
+            read_operand = '0;
+    endfunction
 
-        if (raddr_b <= 5'd7)
-            rdata_b = v_reg[raddr_b[2:0]];
+    // P0 always reads as true; codes above 7 read as 0.
+    function automatic logic [NUM_LANES-1:0] read_predicate(input logic [4:0] addr);
+        if (addr > 5'd7)
+            read_predicate = '0;
+        else if (addr[2:0] == 3'd0)
+            read_predicate = '1;
         else
-            for (int i = 0; i < NUM_LANES; i++) rdata_b[i] = bval_b;
-
-        if (raddr_c <= 5'd7)
-            rdata_c = v_reg[raddr_c[2:0]];
-        else
-            for (int i = 0; i < NUM_LANES; i++) rdata_c[i] = bval_c;
-    end
+            read_predicate = p_reg[addr[2:0]];
+    endfunction
 
     always_comb begin
-        rdata_pm = (pm_sel == 3'd0) ? {NUM_LANES{1'b1}} : p_reg[pm_sel];
-
-        if (raddr_a <= 5'd7)
-            rdata_p_a = (raddr_a[2:0] == 3'd0) ? {NUM_LANES{1'b1}} : p_reg[raddr_a[2:0]];
-        else
-            rdata_p_a = {NUM_LANES{1'b0}};
-
-        if (raddr_b <= 5'd7)
-            rdata_p_b = (raddr_b[2:0] == 3'd0) ? {NUM_LANES{1'b1}} : p_reg[raddr_b[2:0]];
-        else
-            rdata_p_b = {NUM_LANES{1'b0}};
-
-        if (raddr_c <= 5'd7)
-            rdata_p_c = (raddr_c[2:0] == 3'd0) ? {NUM_LANES{1'b1}} : p_reg[raddr_c[2:0]];
-        else
-            rdata_p_c = {NUM_LANES{1'b0}};
+        rdata_a   = read_operand(raddr_a);
+        rdata_b   = read_operand(raddr_b);
+        rdata_c   = read_operand(raddr_c);
+        rdata_pm  = read_predicate({2'b00, pm_sel});
+        rdata_p_a = read_predicate(raddr_a);
+        rdata_p_b = read_predicate(raddr_b);
+        rdata_p_c = read_predicate(raddr_c);
     end
 
     assign vl_out = vl_reg;
@@ -154,53 +110,49 @@ module register_file #(
                 s_reg[r] <= '0;
                 p_reg[r] <= '0;
             end
-            p_reg[0] <= {NUM_LANES{1'b1}};
+            p_reg[0] <= '1;
             vl_reg   <= '0;
         end else begin
-            p_reg[0] <= {NUM_LANES{1'b1}};
+            p_reg[0] <= '1;
 
-            if (wren_v_d && !divmod_conflict) begin
+            if (wren_v_d) begin
                 for (int lane = 0; lane < NUM_LANES; lane++) begin
-                    if (lane_mask_d[lane])
+                    if (lane_mask[lane])
                         v_reg[waddr_d[2:0]][lane] <= format_wdata(wdata_d[lane], wsize_d);
                 end
             end
 
-            if (wren_s_d && !divmod_conflict)
+            if (wren_s_d)
                 s_reg[waddr_d[2:0]] <= format_wdata(wdata_d[0], wsize_d);
 
-            if (wren_p_d && !divmod_conflict && (waddr_d[2:0] != 3'd0)) begin
+            if (wren_p_d && (waddr_d[2:0] != 3'd0)) begin
                 for (int lane = 0; lane < NUM_LANES; lane++) begin
-                    if (lane_mask_d[lane])
+                    if (lane_mask[lane])
                         p_reg[waddr_d[2:0]][lane] <= wdata_p_d[lane];
                 end
             end
 
-            if (wren_v_c && !divmod_conflict) begin
+            // The decoder guarantees C != D when both ports write.
+            if (wren_v_c) begin
                 for (int lane = 0; lane < NUM_LANES; lane++) begin
-                    if (lane_mask_d[lane])
+                    if (lane_mask[lane])
                         v_reg[waddr_c[2:0]][lane] <= format_wdata(wdata_c[lane], wsize_c);
                 end
             end
 
-            if (wren_s_c && !divmod_conflict)
+            if (wren_s_c)
                 s_reg[waddr_c[2:0]] <= format_wdata(wdata_c[0], wsize_c);
 
-            if (wren_p_c && !divmod_conflict && (waddr_c[2:0] != 3'd0)) begin
+            if (wren_p_c && (waddr_c[2:0] != 3'd0)) begin
                 for (int lane = 0; lane < NUM_LANES; lane++) begin
-                    if (lane_mask_d[lane])
+                    if (lane_mask[lane])
                         p_reg[waddr_c[2:0]][lane] <= wdata_p_c[lane];
                 end
             end
 
-            if (setvl_en) begin
-                if (setvl_val <= 31'(NUM_LANES))
-                    vl_reg <= setvl_val;
-                else
-                    vl_reg <= 31'(NUM_LANES);
-            end
+            if (setvl_en)
+                vl_reg <= setvl_val;
         end
     end
-
 
 endmodule
