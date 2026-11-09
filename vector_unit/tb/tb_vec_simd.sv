@@ -62,14 +62,9 @@ module tb_vec_simd;
     return {family, sig, d[3:0], a, b, c, pm};
   endfunction
 
-  // Hierarchical register access (lane index must be a constant in the path).
+  // Hierarchical register access into register_file.
   function automatic logic [63:0] v(input int lane, input int r);
-    case (lane)
-      0: return dut.lanes[0].vec_lane_inst.v_reg[r];
-      1: return dut.lanes[1].vec_lane_inst.v_reg[r];
-      2: return dut.lanes[2].vec_lane_inst.v_reg[r];
-      default: return dut.lanes[3].vec_lane_inst.v_reg[r];
-    endcase
+    return dut.register_file_inst.v_reg[r][lane];
   endfunction
 
   // Present a command, hold it until done or error, then let it commit.
@@ -115,8 +110,8 @@ module tb_vec_simd;
 
   task automatic check_s(input int r, input logic [63:0] want, input string name);
     checks++;
-    if (dut.s_reg[r] !== want) begin
-      $display("FAIL %-28s S%0d = %h expected %h", name, r, dut.s_reg[r], want);
+    if (dut.register_file_inst.s_reg[r] !== want) begin
+      $display("FAIL %-28s S%0d = %h expected %h", name, r, dut.register_file_inst.s_reg[r], want);
       errors++;
     end
   endtask
@@ -160,7 +155,7 @@ module tb_vec_simd;
 
     // EQ.I32 P1 = (V0 == 1), then ADD masked by P1.
     run(enc(ALU, 7'd18, P1, V0, K_ONE, 5'd0), "P1 = (V0 == 1) (EQ.I32)");
-    check(dut.p_reg[1] == 4'b0010, "P1 == 0010");
+    check(dut.register_file_inst.p_reg[1] == 4'b0010, "P1 == 0010");
     run(enc(ALU, 7'd2, V2, V2, K_ONE, 5'd0, 3'd1), "V2 = V2 + 1 masked by P1");
     check_v(2, '{4, 4, 2, 1}, "masked ADD");
 
@@ -202,6 +197,35 @@ module tb_vec_simd;
     check_v(7, '{64'h7FFF_FFFF, 64'h7FFF_FFFF, 64'h7FFF_FFFF, 64'h7FFF_FFFF}, "ADD_SAT clamps");
     check(last_sat_add == 3'd4, $sformatf("4 add saturations (got %0d)", last_sat_add));
 
+    // ---------------------------------------------------------------- predicates / SELECT
+    // V0 = {0,1,2,3}, V1 = {1,2,3,4}, P1 = 0010 (bit i = lane i).
+    run(enc(ALU, 7'd26, P2, V0, K_ONE, 5'd0), "P2 = (V0 < 1) (LT.I32)");
+    check(dut.register_file_inst.p_reg[2] == 4'b0001, "P2 == 0001");
+    run(enc(ALU, 7'd26, P2, V0, S1, 5'd0), "P2 = (V0 < 3) (LT.I32)");
+    check(dut.register_file_inst.p_reg[2] == 4'b0111, "P2 == 0111");
+    run(enc(CONTROL, 7'd1, 5'd3, P1, P2, 5'd0), "PAND P3 = P1 & P2");
+    check(dut.register_file_inst.p_reg[3] == 4'b0010, "P3 == 0010");
+    run(enc(CONTROL, 7'd2, 5'd4, P2, 5'd0, 5'd0), "PNOT P4 = ~P2");
+    check(dut.register_file_inst.p_reg[4] == 4'b1000, "P4 == 1000");
+    // PNOT only updates lanes below VL.
+    run(enc(CONTROL, 7'd0, 5'd0, K_ONE, 5'd0, 5'd0), "SETVL 1");
+    run(enc(CONTROL, 7'd2, 5'd4, 5'd4, 5'd0, 5'd0), "PNOT P4 = ~P4 (VL = 1)");
+    check(dut.register_file_inst.p_reg[4] == 4'b1001, "P4 == 1001 (lanes >= VL kept)");
+    run(enc(CONTROL, 7'd0, 5'd0, S0, 5'd0, 5'd0), "SETVL S0 (4)");
+
+    run(enc(ALU, 7'd34, V5, V0, V1, P2), "V5 = P2 ? V0 : V1 (SELECT.I32)");
+    check_v(5, '{0, 1, 2, 4}, "SELECT.I32");
+    // Scalar SELECT reads C at the lowest enabled lane.
+    run(enc(ALU, 7'd34, S4, S0, S1, P1, 3'd4), "S4 = P1 ? S0 : S1, PM = P4");
+    check_s(4, 64'd3, "scalar SELECT lane 0 (P1[0] = 0)");
+    run(enc(ALU, 7'd34, S4, S0, S1, P1, 3'd3), "S4 = P1 ? S0 : S1, PM = P3");
+    check_s(4, 64'd4, "scalar SELECT lane 1 (P1[1] = 1)");
+
+    // Scalar DIVMOD writes both S[D] and S[C].
+    run(enc(SPECIAL, 7'd4, S4, S2, S0, 5'd13), "S4, S5 = S2 divmod S0 (30 / 4)");
+    check_s(4, 64'd7, "scalar DIVMOD quotient");
+    check_s(5, 64'd2, "scalar DIVMOD remainder");
+
     // ---------------------------------------------------------------- faults
     run(32'hE000_0000, "family 111 is illegal", 1'b1);
     check(faulted, "fault is sticky");
@@ -216,6 +240,17 @@ module tb_vec_simd;
     run(enc(ALU, 7'd2, V1, K_ONE, K_ONE, 5'd0), "V1 = 2");
     run(enc(SPECIAL, 7'd4, V2, V1, V0, V3), "DIVMOD by zero", 1'b1);
     check(v(0, 2) == 0 && v(0, 3) == 0, "DIVMOD by zero wrote nothing");
+
+    // SETVL above the lane count faults and leaves VL unchanged.
+    rst_n = 1'b0;
+    @(posedge clk);
+    rst_n = 1'b1;
+    run(enc(CONTROL, 7'd0, 5'd0, K_ONE, 5'd0, 5'd0), "SETVL 1 after reset");
+    run(enc(ALU, 7'd3, S0, K_ONE, K_ONE, 5'd0), "S0 = 2");
+    run(enc(ALU, 7'd3, S0, S0, S0, 5'd0), "S0 = 4");
+    run(enc(ALU, 7'd3, S0, S0, K_ONE, 5'd0), "S0 = 5");
+    run(enc(CONTROL, 7'd0, 5'd0, S0, 5'd0, 5'd0), "SETVL 5 > NUM_LANES", 1'b1);
+    check(dut.vl == 1, "VL unchanged after SETVL fault");
 
     $display("");
     if (errors == 0)

@@ -1,4 +1,4 @@
-// SIMD unit top: command decoder, central S/P registers and VL, N lanes, and the
+// SIMD unit top: command decoder, register_file (V, S, P, VL), N lanes, and the
 // cross-lane units (REDUCE, PERMUTE routing).
 //
 // Handshake: the issuer presents command with valid and holds both until done or
@@ -55,9 +55,21 @@ module vec_simd #(
   logic lane_command;                   // executed by the lanes
   logic is_permute;
 
-  logic [63:0]          s_reg [8];
-  logic [NUM_LANES-1:0] p_reg [8];
   logic [31:0]          vl;
+
+  // register_file read ports
+  logic [NUM_LANES-1:0][63:0] rf_a, rf_b, rf_c;
+  logic [NUM_LANES-1:0]       rf_pm, rf_p_a, rf_p_b, rf_p_c;
+
+  // Register writes for this command. Everything that changes architectural state
+  // goes through these signals into register_file (a writeback buffer can sit here).
+  logic [NUM_LANES-1:0]       wr_lane_mask;
+  logic                       wr_v_d, wr_s_d, wr_p_d;
+  logic [NUM_LANES-1:0][63:0] wr_data_d;
+  logic [NUM_LANES-1:0]       wr_data_p_d;
+  logic                       wr_v_c, wr_s_c;
+  logic [NUM_LANES-1:0][63:0] wr_data_c;
+  logic                       wr_setvl;
 
   logic [NUM_LANES-1:0] below_vl;
   logic [NUM_LANES-1:0] lane_enable, lane_error, lane_finished;
@@ -107,15 +119,43 @@ module vec_simd #(
 
   assign is_permute = is_data && (sig >= PERMUTE16) && (sig <= PERMUTE64);
 
-  genvar i, j;
+  register_file #(.DATA_WIDTH(64), .NUM_LANES(NUM_LANES)) register_file_inst (
+    .clk(clk),
+    .rst_n(rst_n),
+    .raddr_a(a_code),
+    .raddr_b(b_code),
+    .raddr_c(c_code),
+    .pm_sel(pm),
+    .rdata_a(rf_a),
+    .rdata_b(rf_b),
+    .rdata_c(rf_c),
+    .rdata_pm(rf_pm),
+    .rdata_p_a(rf_p_a),
+    .rdata_p_b(rf_p_b),
+    .rdata_p_c(rf_p_c),
+    .vl_out(vl),
+    .lane_mask(wr_lane_mask),
+    .waddr_d(d_code),
+    .wren_v_d(wr_v_d),
+    .wren_s_d(wr_s_d),
+    .wren_p_d(wr_p_d),
+    .wsize_d(2'b11),                   // results are already zero-filled
+    .wdata_d(wr_data_d),
+    .wdata_p_d(wr_data_p_d),
+    .waddr_c(c_code[3:0]),
+    .wren_v_c(wr_v_c),
+    .wren_s_c(wr_s_c),
+    .wren_p_c(1'b0),
+    .wsize_c(2'b11),
+    .wdata_c(wr_data_c),
+    .wdata_p_c('0),
+    .setvl_en(wr_setvl),
+    .setvl_val(setvl_value)
+  );
+
+  genvar i;
   generate
     for (i = 0; i < NUM_LANES; i++) begin : lanes
-      logic [7:0] p_bits;
-
-      for (j = 0; j < 8; j++) begin : p_slice
-        assign p_bits[j] = p_reg[j][i];
-      end
-
       assign below_vl[i] = (i < vl);
 
       // PERMUTE: this lane reads A from the lane its B selects. Every lane's A is
@@ -129,20 +169,20 @@ module vec_simd #(
         .rst_n(rst_n),
         .family(family),
         .sig(sig),
-        .d_code(d_code),
         .a_code(a_code),
         .b_code(b_code),
         .c_code(c_code),
         .a_type(a_type),
         .b_type(b_type),
         .c_type(c_type),
-        .pm(pm),
         .vl(vl),
         .strict(strict),
-        .commit(commit && lane_command),
         .start(unit_start),
-        .s_reg(s_reg),
-        .p_bits(p_bits),
+        .a_reg(rf_a[i]),
+        .b_reg(rf_b[i]),
+        .c_reg(rf_c[i]),
+        .pm_bit(rf_pm[i]),
+        .select_bit(rf_p_c[i]),
         .permute_data(permute_data[i]),
         .enable(lane_enable[i]),
         .finished(lane_finished[i]),
@@ -190,7 +230,7 @@ module vec_simd #(
       K_ZERO:  setvl_value = 32'd0;
       K_ONE:   setvl_value = 32'd1;
       K_ONES:  setvl_value = 32'hFFFF_FFFF;
-      default: setvl_value = s_reg[a_code[2:0]][31:0];
+      default: setvl_value = rf_a[0][31:0];   // S register, broadcast
     endcase
     setvl_error = is_control && (sig == SETVL) && (setvl_value > NUM_LANES[31:0]);
   end
@@ -249,54 +289,75 @@ module vec_simd #(
     end
   end
 
-  // Central state. V writes happen inside each lane. Registers start at zero;
-  // P0 is always true and is never written (the decoder rejects D = P0).
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      for (int k = 0; k < 8; k++) begin
-        s_reg[k] <= 64'b0;
-        p_reg[k] <= '0;
-      end
-      p_reg[0] <= '1;
-      vl <= 32'd0;
-      faulted <= 1'b0;
-    end else begin
-      if (fault)
-        faulted <= 1'b1;
+  // Register writes, all gated by commit. Inputs were read combinationally, so a
+  // command may write a register it reads.
+  always_comb begin
+    wr_lane_mask = '0;
+    wr_v_d = 1'b0;
+    wr_s_d = 1'b0;
+    wr_p_d = 1'b0;
+    wr_data_d = '0;
+    wr_data_p_d = '0;
+    wr_v_c = 1'b0;
+    wr_s_c = 1'b0;
+    wr_data_c = '0;
+    wr_setvl = 1'b0;
 
-      if (commit && is_control) begin
-        case (sig)
-          SETVL: vl <= setvl_value;
+    if (commit && is_control) begin
+      case (sig)
+        SETVL: wr_setvl = 1'b1;
+        // Update lanes below VL; higher bits keep their values.
+        PAND: begin
+          wr_p_d       = 1'b1;
+          wr_lane_mask = below_vl;
+          wr_data_p_d  = rf_p_a & rf_p_b;
+        end
+        PNOT: begin
+          wr_p_d       = 1'b1;
+          wr_lane_mask = below_vl;
+          wr_data_p_d  = ~rf_p_a;
+        end
+        default: ;
+      endcase
+    end
 
-          // Update lanes below VL; higher bits keep their values.
-          PAND: p_reg[d_code[2:0]] <= (p_reg[a_code[2:0]] & p_reg[b_code[2:0]] & below_vl) |
-                                      (p_reg[d_code[2:0]] & ~below_vl);
+    // REDUCE always writes its scalar, zero when no lane is enabled.
+    if (commit && is_reduce) begin
+      wr_s_d       = 1'b1;
+      wr_data_d[0] = reduce_result;
+    end
 
-          PNOT: p_reg[d_code[2:0]] <= (~p_reg[a_code[2:0]] & below_vl) |
-                                      (p_reg[d_code[2:0]] & ~below_vl);
-
-          default: ;
-        endcase
-      end
-
-      // REDUCE always writes its scalar, zero when no lane is enabled.
-      if (commit && is_reduce)
-        s_reg[d_code[2:0]] <= reduce_result;
-
-      if (commit && lane_command) begin
+    if (commit && lane_command) begin
+      if (predicate_dest) begin
         // EQ / LT: enabled lanes write their bit; disabled lanes keep theirs.
-        if (predicate_dest)
-          p_reg[d_code[2:0]] <= (lane_predicate_result & lane_enable) |
-                                (p_reg[d_code[2:0]] & ~lane_enable);
-        // Scalar D: no enabled lane means no write.
-        else if (scalar_dest && any_enabled) begin
-          s_reg[d_code[2:0]] <= scalar_result;
-          // Scalar DIVMOD remainder; C != D is guaranteed by the decoder.
-          if (second_dest)
-            s_reg[c_code[2:0]] <= scalar_result2;
+        wr_p_d       = 1'b1;
+        wr_lane_mask = lane_enable;
+        wr_data_p_d  = lane_predicate_result;
+      end else if (scalar_dest) begin
+        // Scalar D executes once (lowest enabled lane); no enabled lane, no write.
+        wr_s_d       = any_enabled;
+        wr_data_d[0] = scalar_result;
+        // Scalar DIVMOD remainder; C != D is guaranteed by the decoder.
+        wr_s_c       = any_enabled && second_dest;
+        wr_data_c[0] = scalar_result2;
+      end else begin
+        // Vector D: enabled lanes only. DIVMOD's C is a V register when D is.
+        wr_v_d       = 1'b1;
+        wr_v_c       = second_dest;
+        wr_lane_mask = lane_enable;
+        for (int k = 0; k < NUM_LANES; k++) begin
+          wr_data_d[k] = lane_result[k];
+          wr_data_c[k] = lane_result2[k];
         end
       end
     end
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)
+      faulted <= 1'b0;
+    else if (fault)
+      faulted <= 1'b1;
   end
 
 endmodule

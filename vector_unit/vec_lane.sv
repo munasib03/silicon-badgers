@@ -1,6 +1,7 @@
-// One SIMD lane: lane-local V0..V7, operand muxes, lane enable, execution units,
-// and writeback. Instruction-wide decisions (legality, commit on any-lane error,
-// scalar-once, S and P writes, REDUCE, PERMUTE routing) belong to vec_simd.
+// One SIMD lane: operand constants, lane enable and execution units. Register
+// values come from register_file; results go back to it through vec_simd, which
+// also makes the instruction-wide decisions (legality, commit on any-lane error,
+// scalar-once, REDUCE, PERMUTE routing).
 module vec_lane #(
   parameter int LANE_INDEX = 0
 ) (
@@ -9,21 +10,21 @@ module vec_lane #(
 
   input  logic [2:0]  family,
   input  logic [6:0]  sig,
-  input  logic [3:0]  d_code,            // D field: 0-7 V, 8-15 S
   input  logic [4:0]  a_code,            // A field: 0-7 V, 8-15 S, 16-19 constants
   input  logic [4:0]  b_code,            // B field: same encoding as A
   input  logic [4:0]  c_code,            // C field: numeric (as A), SELECT predicate, or DIVMOD remainder D
   input  logic [3:0]  a_type,            // operand types from vec_decoder
   input  logic [3:0]  b_type,
   input  logic [3:0]  c_type,
-  input  logic [2:0]  pm,                // execution mask predicate P0..P7
   input  logic [31:0] vl,                // active vector length
   input  logic        strict,            // 1: saturation is an error
-  input  logic        commit,            // command passed every lane's checks
   input  logic        start,             // first cycle of a multi-cycle SPECIAL operation
 
-  input  logic [63:0] s_reg [8],         // S0..S7, broadcast to all lanes
-  input  logic [7:0]  p_bits,            // this lane's bit of P0..P7
+  input  logic [63:0] a_reg,             // register_file read of A for this lane (V or S)
+  input  logic [63:0] b_reg,
+  input  logic [63:0] c_reg,
+  input  logic        pm_bit,            // this lane's bit of P[PM] (P0 reads true)
+  input  logic        select_bit,        // this lane's bit of P[C] (SELECT)
   input  logic [63:0] permute_data,      // PERMUTE: A from the lane this lane's B selects
 
   output logic        enable,            // lane is below VL and its PM bit is true
@@ -67,19 +68,12 @@ module vec_lane #(
   localparam logic [6:0] PERMUTE64 = 7'd5;
   localparam logic [6:0] IOTA_U32  = 7'd6;
 
-  localparam logic [6:0] DIVMOD_I32 = 7'd4;
-  localparam logic [6:0] DIVMOD_U64 = 7'd7;
-
   localparam logic [4:0] K_ZERO     = 5'd16;
   localparam logic [4:0] K_NEG_ZERO = 5'd17;
   localparam logic [4:0] K_ONE      = 5'd18;
   localparam logic [4:0] K_ONES     = 5'd19;
 
-  logic [63:0] v_reg [8];
-
-  logic [7:0]  p_live;
   logic [63:0] a, b, c;
-  logic        write_predicate, write_second;
 
   logic        alu_error, alu_saturated_add, alu_saturated_sub;
   logic [63:0] alu_result;
@@ -125,34 +119,13 @@ module vec_lane #(
     endcase
   endfunction
 
-  // P0 is always true.
-  assign p_live = {p_bits[7:1], 1'b1};
+  assign enable = (LANE_INDEX[31:0] < vl) && pm_bit;
 
-  assign enable = (LANE_INDEX[31:0] < vl) && p_live[pm];
-
-  // EQ and LT (ALU FN 2, 3) are the only operations that write a predicate.
-  assign write_predicate = (family == FAMILY_ALU) && (sig[6:4] == 3'b001);
-
-  // DIVMOD also writes its remainder to C.
-  assign write_second = (family == FAMILY_SPECIAL) && (sig >= DIVMOD_I32) && (sig <= DIVMOD_U64);
-
+  // Registers come from register_file; constants depend on the operand type.
   // Operand codes 20-31 are rejected by vec_decoder.
-  always_comb begin
-    if (a_code >= K_ZERO)
-      a = constant(a_code, a_type);
-    else
-      a = a_code[3] ? s_reg[a_code[2:0]] : v_reg[a_code[2:0]];
-
-    if (b_code >= K_ZERO)
-      b = constant(b_code, b_type);
-    else
-      b = b_code[3] ? s_reg[b_code[2:0]] : v_reg[b_code[2:0]];
-
-    if (c_code >= K_ZERO)
-      c = constant(c_code, c_type);
-    else
-      c = c_code[3] ? s_reg[c_code[2:0]] : v_reg[c_code[2:0]];
-  end
+  assign a = (a_code >= K_ZERO) ? constant(a_code, a_type) : a_reg;
+  assign b = (b_code >= K_ZERO) ? constant(b_code, b_type) : b_reg;
+  assign c = (c_code >= K_ZERO) ? constant(c_code, c_type) : c_reg;
 
   assign a_value = a;
   assign b_value = b;
@@ -161,7 +134,7 @@ module vec_lane #(
     .a(a),
     .b(b),
     .sig(sig),
-    .select_predicate(p_live[c_code[2:0]]),
+    .select_predicate(select_bit),
     .strict(strict),
     .error(alu_error),
     .predicate_result(predicate_result),
@@ -260,20 +233,5 @@ module vec_lane #(
   assign saturated_sub     = enable && (family == FAMILY_ALU) && alu_saturated_sub;
   assign saturated_product = enable && (family == FAMILY_PRODUCT) && product_saturated;
   assign saturated_convert = enable && (family == FAMILY_CAST) && cast_saturated;
-
-  // Writeback: vector destinations only. Registers start at zero. All inputs were
-  // read combinationally above, so outputs may reuse input registers.
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      for (int i = 0; i < 8; i++)
-        v_reg[i] <= 64'b0;
-    end else if (commit && enable) begin
-      if (!write_predicate && !d_code[3])
-        v_reg[d_code[2:0]] <= result;
-      // DIVMOD remainder; vec_decoder guarantees C != D and C is V when D is V.
-      if (write_second && !c_code[3])
-        v_reg[c_code[2:0]] <= result2;
-    end
-  end
 
 endmodule
