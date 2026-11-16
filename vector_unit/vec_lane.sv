@@ -1,6 +1,6 @@
-// One SIMD lane: lane-local V0..V7, operand muxes, lane enable, execution units,
-// and writeback. Instruction-wide decisions (legality, commit on any-lane error,
-// scalar-once, S and P writes, REDUCE, PERMUTE routing) belong to vec_simd.
+// One SIMD lane: operand muxes, lane enable, execution units.
+// Instruction-wide decisions (legality, commit on any-lane error,
+// scalar-once, S and P writes, REDUCE, PERMUTE routing) belong to vec_simd / register_file.
 module vec_lane #(
   parameter int LANE_INDEX = 0
 ) (
@@ -22,8 +22,11 @@ module vec_lane #(
   input  logic        commit,            // command passed every lane's checks
   input  logic        start,             // first cycle of a multi-cycle SPECIAL operation
 
-  input  logic [63:0] s_reg [8],         // S0..S7, broadcast to all lanes
-  input  logic [7:0]  p_bits,            // this lane's bit of P0..P7
+  input  logic [63:0] rdata_a,           // operand A from register_file
+  input  logic [63:0] rdata_b,           // operand B from register_file
+  input  logic [63:0] rdata_c,           // operand C from register_file
+  input  logic        rdata_pm,          // PM bit for this lane from register_file
+  input  logic        rdata_p_c,         // SELECT predicate bit for this lane from register_file
   input  logic [63:0] permute_data,      // PERMUTE: A from the lane this lane's B selects
 
   output logic        enable,            // lane is below VL and its PM bit is true
@@ -75,11 +78,7 @@ module vec_lane #(
   localparam logic [4:0] K_ONE      = 5'd18;
   localparam logic [4:0] K_ONES     = 5'd19;
 
-  logic [63:0] v_reg [8];
-
-  logic [7:0]  p_live;
   logic [63:0] a, b, c;
-  logic        write_predicate, write_second;
 
   logic        alu_error, alu_saturated_add, alu_saturated_sub;
   logic [63:0] alu_result;
@@ -125,33 +124,24 @@ module vec_lane #(
     endcase
   endfunction
 
-  // P0 is always true.
-  assign p_live = {p_bits[7:1], 1'b1};
-
-  assign enable = (LANE_INDEX[31:0] < vl) && p_live[pm];
-
-  // EQ and LT (ALU FN 2, 3) are the only operations that write a predicate.
-  assign write_predicate = (family == FAMILY_ALU) && (sig[6:4] == 3'b001);
-
-  // DIVMOD also writes its remainder to C.
-  assign write_second = (family == FAMILY_SPECIAL) && (sig >= DIVMOD_I32) && (sig <= DIVMOD_U64);
+  assign enable = (LANE_INDEX[31:0] < vl) && rdata_pm;
 
   // Operand codes 20-31 are rejected by vec_decoder.
   always_comb begin
     if (a_code >= K_ZERO)
       a = constant(a_code, a_type);
     else
-      a = a_code[3] ? s_reg[a_code[2:0]] : v_reg[a_code[2:0]];
+      a = rdata_a;
 
     if (b_code >= K_ZERO)
       b = constant(b_code, b_type);
     else
-      b = b_code[3] ? s_reg[b_code[2:0]] : v_reg[b_code[2:0]];
+      b = rdata_b;
 
     if (c_code >= K_ZERO)
       c = constant(c_code, c_type);
     else
-      c = c_code[3] ? s_reg[c_code[2:0]] : v_reg[c_code[2:0]];
+      c = rdata_c;
   end
 
   assign a_value = a;
@@ -161,7 +151,7 @@ module vec_lane #(
     .a(a),
     .b(b),
     .sig(sig),
-    .select_predicate(p_live[c_code[2:0]]),
+    .select_predicate(rdata_p_c),
     .strict(strict),
     .error(alu_error),
     .predicate_result(predicate_result),
@@ -260,20 +250,5 @@ module vec_lane #(
   assign saturated_sub     = enable && (family == FAMILY_ALU) && alu_saturated_sub;
   assign saturated_product = enable && (family == FAMILY_PRODUCT) && product_saturated;
   assign saturated_convert = enable && (family == FAMILY_CAST) && cast_saturated;
-
-  // Writeback: vector destinations only. Registers start at zero. All inputs were
-  // read combinationally above, so outputs may reuse input registers.
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      for (int i = 0; i < 8; i++)
-        v_reg[i] <= 64'b0;
-    end else if (commit && enable) begin
-      if (!write_predicate && !d_code[3])
-        v_reg[d_code[2:0]] <= result;
-      // DIVMOD remainder; vec_decoder guarantees C != D and C is V when D is V.
-      if (write_second && !c_code[3])
-        v_reg[c_code[2:0]] <= result2;
-    end
-  end
 
 endmodule
