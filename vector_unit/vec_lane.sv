@@ -18,13 +18,18 @@ module vec_lane #(
   input  logic [3:0]  c_type,
   input  logic [2:0]  pm,                // execution mask predicate P0..P7
   input  logic [31:0] vl,                // active vector length
+  input  logic [31:0] chunk_offset = '0, // [Added] (rchunk_idx * NUM_LANES) for multi-chunk virtual lane indexing
   input  logic        strict,            // 1: saturation is an error
   input  logic        commit,            // command passed every lane's checks
   input  logic        start,             // first cycle of a multi-cycle SPECIAL operation
 
-  input  logic [63:0] s_reg [8],         // S0..S7, broadcast to all lanes
+  input  logic [63:0] s_reg [8],         // S0..S7, broadcast to all lanes (legacy/unused)
   input  logic [7:0]  p_bits,            // this lane's bit of P0..P7
   input  logic [63:0] permute_data,      // PERMUTE: A from the lane this lane's B selects
+  input  logic [63:0] rf_rdata_a,        // [Added] Operand A read directly from central register file
+  input  logic [63:0] rf_rdata_b,        // [Added] Operand B read directly from central register file
+  input  logic [63:0] rf_rdata_c,        // [Added] Operand C read directly from central register file
+  input  logic [63:0] v_reg_in [8],      // [Added] This lane's slice of V0..V7 from central register file
 
   output logic        enable,            // lane is below VL and its PM bit is true
   output logic        finished,          // multi-cycle units are done (high for other ops)
@@ -75,7 +80,9 @@ module vec_lane #(
   localparam logic [4:0] K_ONE      = 5'd18;
   localparam logic [4:0] K_ONES     = 5'd19;
 
+  // Vector registers reside centrally in register_file_chunked; exposed here for testbench / debug visibility
   logic [63:0] v_reg [8];
+  assign v_reg = v_reg_in;
 
   logic [7:0]  p_live;
   logic [63:0] a, b, c;
@@ -128,7 +135,7 @@ module vec_lane #(
   // P0 is always true.
   assign p_live = {p_bits[7:1], 1'b1};
 
-  assign enable = (LANE_INDEX[31:0] < vl) && p_live[pm];
+  assign enable = ((chunk_offset + LANE_INDEX[31:0]) < vl) && p_live[pm];
 
   // EQ and LT (ALU FN 2, 3) are the only operations that write a predicate.
   assign write_predicate = (family == FAMILY_ALU) && (sig[6:4] == 3'b001);
@@ -137,21 +144,22 @@ module vec_lane #(
   assign write_second = (family == FAMILY_SPECIAL) && (sig >= DIVMOD_I32) && (sig <= DIVMOD_U64);
 
   // Operand codes 20-31 are rejected by vec_decoder.
+  // Values are read from central register file (rf_rdata_*) or formatted constants.
   always_comb begin
     if (a_code >= K_ZERO)
       a = constant(a_code, a_type);
     else
-      a = a_code[3] ? s_reg[a_code[2:0]] : v_reg[a_code[2:0]];
+      a = rf_rdata_a;
 
     if (b_code >= K_ZERO)
       b = constant(b_code, b_type);
     else
-      b = b_code[3] ? s_reg[b_code[2:0]] : v_reg[b_code[2:0]];
+      b = rf_rdata_b;
 
     if (c_code >= K_ZERO)
       c = constant(c_code, c_type);
     else
-      c = c_code[3] ? s_reg[c_code[2:0]] : v_reg[c_code[2:0]];
+      c = rf_rdata_c;
   end
 
   assign a_value = a;
@@ -261,19 +269,7 @@ module vec_lane #(
   assign saturated_product = enable && (family == FAMILY_PRODUCT) && product_saturated;
   assign saturated_convert = enable && (family == FAMILY_CAST) && cast_saturated;
 
-  // Writeback: vector destinations only. Registers start at zero. All inputs were
-  // read combinationally above, so outputs may reuse input registers.
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      for (int i = 0; i < 8; i++)
-        v_reg[i] <= 64'b0;
-    end else if (commit && enable) begin
-      if (!write_predicate && !d_code[3])
-        v_reg[d_code[2:0]] <= result;
-      // DIVMOD remainder; vec_decoder guarantees C != D and C is V when D is V.
-      if (write_second && !c_code[3])
-        v_reg[c_code[2:0]] <= result2;
-    end
-  end
+  // [Note] Vector writeback logic originally here is now centralized inside register_file_chunked.
+  // v_reg is driven as an alias from register_file_chunked for testbench inspection.
 
 endmodule

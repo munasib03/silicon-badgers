@@ -10,7 +10,8 @@
 //   An illegal command reports error immediately without starting.
 // Any fault writes nothing and blocks the sequence until reset.
 module vec_simd #(
-  parameter int NUM_LANES = 8
+  parameter int NUM_LANES  = 8,
+  parameter int NUM_CHUNKS = 1          // [Added] Number of virtual chunks (1 = single-cycle / no chunking)
 ) (
   input  logic        clk,
   input  logic        rst_n,
@@ -28,7 +29,9 @@ module vec_simd #(
   output logic [$clog2(NUM_LANES+1)-1:0] saturated_convert_count
 );
 
-  localparam int COUNT_WIDTH = $clog2(NUM_LANES+1);
+  localparam int COUNT_WIDTH   = $clog2(NUM_LANES+1);
+  localparam int CHUNK_WIDTH   = (NUM_CHUNKS > 1) ? $clog2(NUM_CHUNKS) : 1;
+  localparam int VIRTUAL_LANES = NUM_LANES * NUM_CHUNKS;
 
   localparam logic [6:0] SETVL = 7'd0;
   localparam logic [6:0] PAND  = 7'd1;
@@ -49,15 +52,66 @@ module vec_simd #(
   logic [2:0] pm;
   logic is_control, is_alu, is_product, is_reduce, is_cast, is_special, is_data;
   logic predicate_dest, scalar_dest, second_dest, multi_cycle, illegal;
-  logic running;                        // multi-cycle units are working
   logic unit_start;                     // starts the lanes' sequential units
   logic exec_ready;                     // results of this command are available
   logic lane_command;                   // executed by the lanes
   logic is_permute;
 
+  // Central register file signals
+  logic [CHUNK_WIDTH-1:0]       rchunk_idx;
+  logic [CHUNK_WIDTH-1:0]       wchunk_idx_d;
+  logic                         wchunk_valid_d;
+  logic                         wchunk_commit_d;
+  logic [CHUNK_WIDTH-1:0]       wchunk_idx_c;
+  logic                         wchunk_valid_c;
+
+  logic [NUM_LANES-1:0][63:0]   rf_rdata_a;
+  logic [NUM_LANES-1:0][63:0]   rf_rdata_b;
+  logic [NUM_LANES-1:0][63:0]   rf_rdata_c;
+  logic [NUM_LANES-1:0]         rf_rdata_pm;
+  logic [NUM_LANES-1:0]         rf_rdata_p_a;
+  logic [NUM_LANES-1:0]         rf_rdata_p_b;
+  logic [NUM_LANES-1:0]         rf_rdata_p_c;
+  logic [31:0]                  vl_out;
+
+  logic                         wren_v_d;
+  logic                         wren_s_d;
+  logic                         wren_p_d;
+  logic [1:0]                   wsize_d;
+  logic [NUM_LANES-1:0]         lane_mask_d;
+  logic [NUM_LANES-1:0][63:0]   wdata_d;
+  logic [NUM_LANES-1:0]         wdata_p_d;
+
+  logic                         wren_v_c;
+  logic                         wren_s_c;
+  logic [1:0]                   wsize_c;
+  logic [NUM_LANES-1:0][63:0]   wdata_c;
+
+  logic                         setvl_en;
+  logic [31:0]                  setvl_val;
+
+  logic                         wb_busy_d;
+  logic                         divmod_conflict;
+
+  // Active vector length driven directly by register_file_chunked
+  logic [31:0]          vl;
+  assign vl = vl_out;
+
+  // s_reg and p_reg wires exposed from register_file_chunked for internal logic and testbench inspection
   logic [63:0]          s_reg [8];
   logic [NUM_LANES-1:0] p_reg [8];
-  logic [31:0]          vl;
+  assign s_reg = rf_inst.s_reg;
+  for (genvar pr = 0; pr < 8; pr++) begin : gen_p_reg_wire
+    assign p_reg[pr] = rf_inst.p_reg[pr][NUM_LANES-1:0];
+  end
+
+  // Expose each lane's slice of vector registers from register_file_chunked
+  logic [63:0] rf_v_reg_slice [NUM_LANES][8];
+  for (genvar l = 0; l < NUM_LANES; l++) begin : gen_lane_v
+    for (genvar vr = 0; vr < 8; vr++) begin : gen_v_slice
+      assign rf_v_reg_slice[l][vr] = rf_inst.v_reg[vr][(rchunk_idx * NUM_LANES) + l];
+    end
+  end
 
   logic [NUM_LANES-1:0] below_vl;
   logic [NUM_LANES-1:0] lane_enable, lane_error, lane_finished;
@@ -113,10 +167,10 @@ module vec_simd #(
       logic [7:0] p_bits;
 
       for (j = 0; j < 8; j++) begin : p_slice
-        assign p_bits[j] = p_reg[j][i];
+        assign p_bits[j] = rf_inst.p_reg[j][(rchunk_idx * NUM_LANES) + i];
       end
 
-      assign below_vl[i] = (i < vl);
+      assign below_vl[i] = (((rchunk_idx * NUM_LANES) + i) < vl);
 
       // PERMUTE: this lane reads A from the lane its B selects. Every lane's A is
       // read before any write, so in-place permutation works.
@@ -138,12 +192,17 @@ module vec_simd #(
         .c_type(c_type),
         .pm(pm),
         .vl(vl),
+        .chunk_offset(32'(rchunk_idx * NUM_LANES)),
         .strict(strict),
         .commit(commit && lane_command),
         .start(unit_start),
         .s_reg(s_reg),
         .p_bits(p_bits),
         .permute_data(permute_data[i]),
+        .rf_rdata_a(rf_rdata_a[i]),
+        .rf_rdata_b(rf_rdata_b[i]),
+        .rf_rdata_c(rf_rdata_c[i]),
+        .v_reg_in(rf_v_reg_slice[i]),
         .enable(lane_enable[i]),
         .finished(lane_finished[i]),
         .error(lane_error[i]),
@@ -192,7 +251,7 @@ module vec_simd #(
       K_ONES:  setvl_value = 32'hFFFF_FFFF;
       default: setvl_value = s_reg[a_code[2:0]][31:0];
     endcase
-    setvl_error = is_control && (sig == SETVL) && (setvl_value > NUM_LANES[31:0]);
+    setvl_error = is_control && (sig == SETVL) && (setvl_value > VIRTUAL_LANES[31:0]);
   end
 
   // An enabled lane's index must be below the physical lane count; the source
@@ -201,29 +260,15 @@ module vec_simd #(
 
   assign lane_command = is_alu || is_product || is_cast || is_special || is_data;
 
-  // Multi-cycle commands: start the units in the first cycle, then wait. All lanes
-  // run the same operation, so they finish together.
-  assign unit_start = valid && !faulted && !illegal && multi_cycle && !running;
-  assign exec_ready = !multi_cycle || (running && (&lane_finished));
-  assign busy       = running;
-
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n)
-      running <= 1'b0;
-    else if (unit_start)
-      running <= 1'b1;
-    else if (running && (&lane_finished))
-      running <= 1'b0;
-  end
+  // Single-cycle units are ready immediately; multi-cycle units wait for all lanes
+  assign exec_ready = !multi_cycle || (&lane_finished);
 
   // Check every enabled lane before committing any output.
   assign fault  = valid && !faulted &&
-                  (illegal ||
+                  (illegal || divmod_conflict ||
                    (exec_ready && (setvl_error || permute_error ||
                                    (lane_command && |lane_error) ||
                                    (is_reduce && reduce_error))));
-  assign commit = valid && !faulted && !fault && exec_ready;
-  assign done   = commit;
   assign error  = valid && (faulted || fault);
 
   // Saturation is recorded in strict mode too. Scalar D counts once.
@@ -249,53 +294,146 @@ module vec_simd #(
     end
   end
 
-  // Central state. V writes happen inside each lane. Registers start at zero;
-  // P0 is always true and is never written (the decoder rejects D = P0).
+  // =========================================================================
+  // Central Register File Instantiation & Writeback Routing
+  // =========================================================================
+
+  // Write enables
+  assign setvl_en  = commit && is_control && (sig == SETVL);
+  assign setvl_val = setvl_value;
+
+  assign wren_s_d  = commit && (is_reduce || (lane_command && scalar_dest && any_enabled));
+  assign wren_p_d  = (commit || wchunk_valid_d) && ((lane_command && predicate_dest) ||
+                                (is_control && ((sig == PAND) || (sig == PNOT))));
+  assign wren_v_d  = (commit || wchunk_valid_d) && lane_command && !predicate_dest && !scalar_dest;
+  assign wsize_d   = 2'b11; // Full 64-bit
+
+  // Mask: CONTROL PAND/PNOT updates below VL; vector & predicate ALU update enabled lanes
+  assign lane_mask_d = (is_control && (sig == PAND || sig == PNOT)) ? below_vl : lane_enable;
+
+  // Data routing to destination D
+  always_comb begin
+    if (is_reduce) begin
+      wdata_d = '{default: 64'b0};
+      wdata_d[0] = reduce_result;
+    end else if (scalar_dest) begin
+      wdata_d = '{default: 64'b0};
+      wdata_d[0] = scalar_result;
+    end else begin
+      for (int k = 0; k < NUM_LANES; k++) begin
+        wdata_d[k] = lane_result[k];
+      end
+    end
+  end
+
+  // Predicate data routing
+  always_comb begin
+    if (is_control && (sig == PAND))
+      wdata_p_d = rf_rdata_p_a & rf_rdata_p_b;
+    else if (is_control && (sig == PNOT))
+      wdata_p_d = ~rf_rdata_p_a;
+    else
+      wdata_p_d = lane_predicate_result;
+  end
+
+  // Secondary write port C (DIVMOD remainder)
+  assign wren_v_c  = (commit || wchunk_valid_c) && lane_command && second_dest && !c_code[3];
+  assign wren_s_c  = commit && lane_command && second_dest && c_code[3] && any_enabled;
+  assign wsize_c   = 2'b11;
+
+  always_comb begin
+    if (scalar_dest) begin
+      wdata_c = '{default: 64'b0};
+      wdata_c[0] = scalar_result2;
+    end else begin
+      for (int k = 0; k < NUM_LANES; k++) begin
+        wdata_c[k] = lane_result2[k];
+      end
+    end
+  end
+
+  // Chunk Sequencer: manages multi-cycle / multi-chunk timing, iteration, and staging
+  vec_sequencer #(
+    .NUM_LANES(NUM_LANES),
+    .NUM_CHUNKS(NUM_CHUNKS)
+  ) seq_inst (
+    .clk            (clk),
+    .rst_n          (rst_n),
+    .valid          (valid),
+    .faulted        (faulted),
+    .fault          (fault),
+    .is_vector_op   (lane_command && !scalar_dest),
+    .multi_cycle    (multi_cycle),
+    .lanes_finished (&lane_finished),
+    .vl             (vl),
+    .wren_v_d_raw   (lane_command && !predicate_dest && !scalar_dest),
+    .wren_p_d_raw   ((lane_command && predicate_dest) || (is_control && ((sig == PAND) || (sig == PNOT)))),
+    .wren_v_c_raw   (lane_command && second_dest && !c_code[3]),
+    .chunk_start    (unit_start),
+    .busy           (busy),
+    .done           (done),
+    .seq_commit     (commit),
+    .rchunk_idx     (rchunk_idx),
+    .wchunk_idx_d   (wchunk_idx_d),
+    .wchunk_valid_d (wchunk_valid_d),
+    .wchunk_commit_d(wchunk_commit_d),
+    .wchunk_idx_c   (wchunk_idx_c),
+    .wchunk_valid_c (wchunk_valid_c)
+  );
+
+  // Register file instance: holds all architectural state (V, S, P, VL)
+  register_file_chunked #(
+    .DATA_WIDTH(64),
+    .PHYSICAL_LANES(NUM_LANES),
+    .NUM_CHUNKS(NUM_CHUNKS)
+  ) rf_inst (
+    .clk(clk),
+    .rst_n(rst_n),
+    .raddr_a(a_code),
+    .raddr_b(b_code),
+    .raddr_c(c_code),
+    .pm_sel(pm),
+    .rchunk_idx(rchunk_idx),
+    .rdata_a(rf_rdata_a),
+    .rdata_b(rf_rdata_b),
+    .rdata_c(rf_rdata_c),
+    .rdata_pm(rf_rdata_pm),
+    .rdata_p_a(rf_rdata_p_a),
+    .rdata_p_b(rf_rdata_p_b),
+    .rdata_p_c(rf_rdata_p_c),
+    .vl_out(vl_out),
+    .waddr_d(d_code),
+    .wren_v_d(wren_v_d),
+    .wren_s_d(wren_s_d),
+    .wren_p_d(wren_p_d),
+    .wsize_d(wsize_d),
+    .wchunk_idx_d(wchunk_idx_d),
+    .wchunk_valid_d(wchunk_valid_d),
+    .wchunk_commit_d(wchunk_commit_d),
+    .lane_mask_d(lane_mask_d),
+    .wdata_d(wdata_d),
+    .wdata_p_d(wdata_p_d),
+    .waddr_c(c_code[3:0]),
+    .wren_v_c(wren_v_c),
+    .wren_s_c(wren_s_c),
+    .wsize_c(wsize_c),
+    .wchunk_idx_c(wchunk_idx_c),
+    .wchunk_valid_c(wchunk_valid_c),
+    .wdata_c(wdata_c),
+    .setvl_en(setvl_en),
+    .setvl_val(setvl_val),
+    .wb_busy_d(wb_busy_d),
+    .divmod_conflict(divmod_conflict)
+  );
+
+  // Status tracking: faulted is sticky until reset.
+  // All register state (s_reg, p_reg, vl, v_reg) sequential updates originally here
+  // are now centralized inside register_file_chunked.
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      for (int k = 0; k < 8; k++) begin
-        s_reg[k] <= 64'b0;
-        p_reg[k] <= '0;
-      end
-      p_reg[0] <= '1;
-      vl <= 32'd0;
       faulted <= 1'b0;
-    end else begin
-      if (fault)
-        faulted <= 1'b1;
-
-      if (commit && is_control) begin
-        case (sig)
-          SETVL: vl <= setvl_value;
-
-          // Update lanes below VL; higher bits keep their values.
-          PAND: p_reg[d_code[2:0]] <= (p_reg[a_code[2:0]] & p_reg[b_code[2:0]] & below_vl) |
-                                      (p_reg[d_code[2:0]] & ~below_vl);
-
-          PNOT: p_reg[d_code[2:0]] <= (~p_reg[a_code[2:0]] & below_vl) |
-                                      (p_reg[d_code[2:0]] & ~below_vl);
-
-          default: ;
-        endcase
-      end
-
-      // REDUCE always writes its scalar, zero when no lane is enabled.
-      if (commit && is_reduce)
-        s_reg[d_code[2:0]] <= reduce_result;
-
-      if (commit && lane_command) begin
-        // EQ / LT: enabled lanes write their bit; disabled lanes keep theirs.
-        if (predicate_dest)
-          p_reg[d_code[2:0]] <= (lane_predicate_result & lane_enable) |
-                                (p_reg[d_code[2:0]] & ~lane_enable);
-        // Scalar D: no enabled lane means no write.
-        else if (scalar_dest && any_enabled) begin
-          s_reg[d_code[2:0]] <= scalar_result;
-          // Scalar DIVMOD remainder; C != D is guaranteed by the decoder.
-          if (second_dest)
-            s_reg[c_code[2:0]] <= scalar_result2;
-        end
-      end
+    end else if (fault) begin
+      faulted <= 1'b1;
     end
   end
 
